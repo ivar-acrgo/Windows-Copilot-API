@@ -13,3 +13,7 @@ MODEL_NAME = "copilot"
 # upstream 502s, so the limiter only bites when callers try to exceed that.
 RATE_LIMIT_RPM = float(os.environ.get("RATE_LIMIT_RPM", "12"))  # 12 rpm ≈ 5s per call
 RATE_LIMIT_BURST = int(os.environ.get("RATE_LIMIT_BURST", "4"))
+
+# How long to remember Copilot conversation ids for stateless OpenAI clients that
+# resend full message history without conversation_id. 0 disables auto-mapping.
+SESSION_TTL_SECONDS = float(os.environ.get("SESSION_TTL_SECONDS", str(24 * 3600)))

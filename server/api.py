@@ -2,6 +2,7 @@
 
 import threading
 import time
+from typing import List, Optional, Tuple
 
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -9,16 +10,17 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from copilot import CopilotClient
 from copilot.driver import ClearanceRequired
 
-from .config import MODEL_NAME, RATE_LIMIT_BURST, RATE_LIMIT_RPM
+from .config import MODEL_NAME, RATE_LIMIT_BURST, RATE_LIMIT_RPM, SESSION_TTL_SECONDS
 from .openai_format import (
     completion_response,
     new_id,
     sse_event,
     stream_chunk,
 )
-from .prompt import messages_to_prompt
+from .prompt import messages_session_key, messages_store_key, turn_prompt
 from .ratelimit import TokenBucket
-from .schemas import ChatCompletionRequest
+from .schemas import ChatCompletionRequest, ChatMessage
+from .sessions import ConversationSessionStore
 
 app = FastAPI(title="Copilot OpenAI-compatible API", version="1.0.0")
 # Server runs headless and must never pop a visible browser mid-request. With
@@ -37,6 +39,9 @@ _CLEARANCE_HELP = (
 # Self-imposed rate limit on top of the concurrency lock below: this caps
 # requests-per-minute, the lock caps requests-in-flight. See server/ratelimit.py.
 _rate_limiter = TokenBucket(RATE_LIMIT_RPM, RATE_LIMIT_BURST)
+
+# Maps stateless clients' message-history keys to Copilot conversation ids.
+_session_store = ConversationSessionStore(SESSION_TTL_SECONDS)
 
 
 def _rate_limited_response():
@@ -58,6 +63,24 @@ def _rate_limited_response():
         }},
     )
 
+
+def _resolve_turn(
+    messages: List[ChatMessage],
+    explicit_conversation_id: Optional[str],
+) -> Tuple[Optional[str], str]:
+    """Pick Copilot ``conversation_id`` and the single-turn prompt to send upstream."""
+    prompt = turn_prompt(messages)
+    if explicit_conversation_id:
+        return explicit_conversation_id, prompt
+    lookup_key = messages_session_key(messages)
+    return _session_store.get(lookup_key), prompt
+
+
+def _record_turn(messages: List[ChatMessage], conversation_id: Optional[str]) -> None:
+    store_key = messages_store_key(messages)
+    _session_store.put(store_key, conversation_id)
+
+
 # Copilot's per-account chat socket doesn't tolerate concurrent conversations
 # from one process (parallel requests error out or hang). This server bridges a
 # single signed-in account, so we serialize upstream calls: concurrent HTTP
@@ -66,37 +89,37 @@ def _rate_limited_response():
 _upstream_lock = threading.Lock()
 
 
-def _stream(prompt: str, model: str, conversation_id=None):
-    """Yield OpenAI ``chat.completion.chunk`` SSE events for ``prompt``.
-
-    ``conversation_id`` continues an existing Copilot thread; ``None`` starts a
-    fresh one (its id is emitted on the final chunk).
-    """
+def _stream(messages: List[ChatMessage], prompt: str, model: str, conversation_id=None):
+    """Yield OpenAI ``chat.completion.chunk`` SSE events for ``prompt``."""
     cid = new_id()
     created = int(time.time())
+    conv_id = conversation_id
+    text_parts: List[str] = []
     try:
-        with _upstream_lock:  # one upstream chat at a time (released on disconnect)
+        with _upstream_lock:
             yield sse_event(stream_chunk(cid, created, model, {"role": "assistant"}))
             stream = client.stream(prompt, conversation_id=conversation_id)
             for piece in stream:
                 if isinstance(piece, str) and piece:
+                    text_parts.append(piece)
                     yield sse_event(stream_chunk(cid, created, model, {"content": piece}))
-            # Copilot's conversation id is known once the stream has run; emit it
-            # on the final chunk so callers can track the upstream thread.
+            conv_id = stream.conversation_id
             yield sse_event(
                 stream_chunk(
                     cid, created, model, {}, finish="stop",
-                    conversation_id=stream.conversation_id,
+                    conversation_id=conv_id,
                 )
             )
     except ClearanceRequired:
         yield sse_event(
             stream_chunk(cid, created, model, {"content": f"\n[error: {_CLEARANCE_HELP}]"}, finish="error")
         )
-    except Exception as exc:  # surface errors to the client instead of hanging
+    except Exception as exc:
         yield sse_event(
             stream_chunk(cid, created, model, {"content": f"\n[error: {exc}]"}, finish="error")
         )
+    else:
+        _record_turn(messages, conv_id)
     yield "data: [DONE]\n\n"
 
 
@@ -112,7 +135,7 @@ def list_models():
 
 @app.post("/v1/chat/completions")
 def chat_completions(req: ChatCompletionRequest):
-    prompt = messages_to_prompt(req.messages)
+    conversation_id, prompt = _resolve_turn(req.messages, req.conversation_id)
     if not prompt.strip():
         return JSONResponse(
             status_code=400,
@@ -120,20 +143,19 @@ def chat_completions(req: ChatCompletionRequest):
         )
     model = req.model or MODEL_NAME
 
-    # Enforce the per-minute ceiling before touching the upstream lock, so excess
-    # callers get a fast 429 instead of piling up behind the serialized queue.
     limited = _rate_limited_response()
     if limited is not None:
         return limited
 
     if req.stream:
         return StreamingResponse(
-            _stream(prompt, model, req.conversation_id), media_type="text/event-stream"
+            _stream(req.messages, prompt, model, conversation_id),
+            media_type="text/event-stream",
         )
 
     try:
-        with _upstream_lock:  # serialize: one upstream chat at a time
-            reply = client.chat(prompt, conversation_id=req.conversation_id)
+        with _upstream_lock:
+            reply = client.chat(prompt, conversation_id=conversation_id)
     except ClearanceRequired:
         return JSONResponse(
             status_code=503,
@@ -144,6 +166,7 @@ def chat_completions(req: ChatCompletionRequest):
             status_code=502,
             content={"error": {"message": str(exc), "type": "upstream_error"}},
         )
+    _record_turn(req.messages, reply.conversation_id)
     return completion_response(reply.text, model, reply.conversation_id)
 
 

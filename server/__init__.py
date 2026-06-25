@@ -14,7 +14,8 @@ Code is split by concern:
 
     config.py         constants
     schemas.py        pydantic request models
-    prompt.py         flatten OpenAI messages -> one Copilot prompt
+    prompt.py         OpenAI messages -> per-turn Copilot prompt + session keys
+    sessions.py       in-memory conversation_id cache for stateless clients
     openai_format.py  build OpenAI response/chunk shapes
     api.py            FastAPI app, routes, upstream serialization
 """
