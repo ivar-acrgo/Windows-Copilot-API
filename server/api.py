@@ -17,7 +17,13 @@ from .openai_format import (
     sse_event,
     stream_chunk,
 )
-from .prompt import messages_session_key, messages_store_key, turn_prompt
+from .prompt import (
+    has_image_placeholder_without_bytes,
+    messages_session_key,
+    messages_store_key,
+    turn_image,
+    turn_prompt,
+)
 from .ratelimit import TokenBucket
 from .schemas import ChatCompletionRequest, ChatMessage
 from .sessions import ConversationSessionStore
@@ -67,13 +73,18 @@ def _rate_limited_response():
 def _resolve_turn(
     messages: List[ChatMessage],
     explicit_conversation_id: Optional[str],
-) -> Tuple[Optional[str], str]:
-    """Pick Copilot ``conversation_id`` and the single-turn prompt to send upstream."""
-    prompt = turn_prompt(messages)
+) -> Tuple[Optional[str], str, Optional[bytes]]:
+    """Pick Copilot ``conversation_id``, prompt, and optional image for one turn."""
+    image = turn_image(messages)
+    prompt = turn_prompt(messages, image_attached=image is not None)
     if explicit_conversation_id:
-        return explicit_conversation_id, prompt
+        return explicit_conversation_id, prompt, image
     lookup_key = messages_session_key(messages)
-    return _session_store.get(lookup_key), prompt
+    return _session_store.get(lookup_key), prompt, image
+
+
+def _upstream_kwargs(image: Optional[bytes]) -> dict:
+    return {"image": image} if image is not None else {}
 
 
 def _record_turn(messages: List[ChatMessage], conversation_id: Optional[str]) -> None:
@@ -89,16 +100,23 @@ def _record_turn(messages: List[ChatMessage], conversation_id: Optional[str]) ->
 _upstream_lock = threading.Lock()
 
 
-def _stream(messages: List[ChatMessage], prompt: str, model: str, conversation_id=None):
+def _stream(
+    messages: List[ChatMessage],
+    prompt: str,
+    model: str,
+    conversation_id=None,
+    image: Optional[bytes] = None,
+):
     """Yield OpenAI ``chat.completion.chunk`` SSE events for ``prompt``."""
     cid = new_id()
     created = int(time.time())
     conv_id = conversation_id
     text_parts: List[str] = []
+    upstream = _upstream_kwargs(image)
     try:
         with _upstream_lock:
             yield sse_event(stream_chunk(cid, created, model, {"role": "assistant"}))
-            stream = client.stream(prompt, conversation_id=conversation_id)
+            stream = client.stream(prompt, conversation_id=conversation_id, **upstream)
             for piece in stream:
                 if isinstance(piece, str) and piece:
                     text_parts.append(piece)
@@ -135,13 +153,33 @@ def list_models():
 
 @app.post("/v1/chat/completions")
 def chat_completions(req: ChatCompletionRequest):
-    conversation_id, prompt = _resolve_turn(req.messages, req.conversation_id)
-    if not prompt.strip():
+    try:
+        conversation_id, prompt, image = _resolve_turn(req.messages, req.conversation_id)
+    except ValueError as exc:
+        return JSONResponse(
+            status_code=400,
+            content={"error": {"message": str(exc), "type": "invalid_request_error"}},
+        )
+    if has_image_placeholder_without_bytes(req.messages):
+        return JSONResponse(
+            status_code=400,
+            content={"error": {
+                "message": (
+                    "The request contains an [Image: ...] placeholder but no image "
+                    "bytes. Cherry Studio must send a real image_url or file part "
+                    "(data:image/...;base64,...) — placeholders alone cannot be "
+                    "forwarded to Copilot."
+                ),
+                "type": "invalid_request_error",
+            }},
+        )
+    if not prompt.strip() and image is None:
         return JSONResponse(
             status_code=400,
             content={"error": {"message": "no text content in messages", "type": "invalid_request_error"}},
         )
     model = req.model or MODEL_NAME
+    upstream = _upstream_kwargs(image)
 
     limited = _rate_limited_response()
     if limited is not None:
@@ -149,13 +187,13 @@ def chat_completions(req: ChatCompletionRequest):
 
     if req.stream:
         return StreamingResponse(
-            _stream(req.messages, prompt, model, conversation_id),
+            _stream(req.messages, prompt, model, conversation_id, image=image),
             media_type="text/event-stream",
         )
 
     try:
         with _upstream_lock:
-            reply = client.chat(prompt, conversation_id=conversation_id)
+            reply = client.chat(prompt, conversation_id=conversation_id, **upstream)
     except ClearanceRequired:
         return JSONResponse(
             status_code=503,

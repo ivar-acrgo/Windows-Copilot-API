@@ -139,13 +139,20 @@ class Copilot(AbstractProvider):
             images = []
             if image is not None:
                 data = to_bytes(image)
+                upload_url = f"{self.url}/c/api/attachments"
+                if conversation_id:
+                    upload_url = f"{upload_url}?conversationId={conversation_id}"
                 response = session.post(
-                    f"{self.url}/c/api/attachments",
+                    upload_url,
                     headers={"content-type": is_accepted_format(data)},
                     data=data,
                 )
                 raise_for_status(response)
-                images.append({"type": "image", "url": response.json().get("url")})
+                attachment = response.json()
+                image_part = {"type": "image", "url": attachment.get("url")}
+                if attachment.get("id"):
+                    image_part["id"] = attachment["id"]
+                images.append(image_part)
 
             send_frame = json.dumps({
                 "event": "send",
