@@ -79,6 +79,29 @@ class TurnImageTests(unittest.TestCase):
         ]
         self.assertEqual(turn_image(messages), raw)
 
+    def test_cherry_studio_image_part_with_raw_base64(self):
+        raw = b"\x89PNG\r\n\x1a\ncherry"
+        b64 = base64.b64encode(raw).decode("ascii")
+        messages = [
+            _msg(
+                "user",
+                [
+                    {"type": "text", "text": "Reverse-engineer the prompt."},
+                    {"type": "image", "image": b64, "mediaType": "image/png"},
+                ],
+            )
+        ]
+        self.assertEqual(turn_image(messages), raw)
+
+    def test_split_user_bubbles_image_then_text(self):
+        raw = b"\xff\xd8\xffsplit"
+        b64 = base64.b64encode(raw).decode("ascii")
+        messages = [
+            _msg("user", [{"type": "image", "image": b64, "mediaType": "image/jpeg"}]),
+            _msg("user", "What is in the image?"),
+        ]
+        self.assertEqual(turn_image(messages), raw)
+
 
 class TurnPromptImageTests(unittest.TestCase):
     def test_default_prompt_when_image_only(self):
@@ -109,6 +132,18 @@ class ImagePlaceholderTests(unittest.TestCase):
                 [
                     {"type": "text", "text": "Describe this image."},
                     {"type": "text", "text": "[Image: image/png]"},
+                ],
+            )
+        ]
+        self.assertTrue(has_image_placeholder_without_bytes(messages))
+
+    def test_image_part_without_payload_is_detected(self):
+        messages = [
+            _msg(
+                "user",
+                [
+                    {"type": "text", "text": "Describe this."},
+                    {"type": "file", "file": {"filename": "shot.png"}},
                 ],
             )
         ]

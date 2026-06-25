@@ -1,5 +1,6 @@
 """FastAPI app wiring Copilot onto the OpenAI Chat Completions API."""
 
+import sys
 import threading
 import time
 from typing import List, Optional, Tuple
@@ -10,7 +11,14 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from copilot import CopilotClient
 from copilot.driver import ClearanceRequired
 
-from .config import MODEL_NAME, RATE_LIMIT_BURST, RATE_LIMIT_RPM, SESSION_TTL_SECONDS
+from .config import (
+    DEBUG_REQUESTS,
+    MODEL_ALIASES,
+    MODEL_NAME,
+    RATE_LIMIT_BURST,
+    RATE_LIMIT_RPM,
+    SESSION_TTL_SECONDS,
+)
 from .openai_format import (
     completion_response,
     new_id,
@@ -18,6 +26,7 @@ from .openai_format import (
     stream_chunk,
 )
 from .prompt import (
+    describe_trailing_content,
     has_image_placeholder_without_bytes,
     messages_session_key,
     messages_store_key,
@@ -87,6 +96,23 @@ def _upstream_kwargs(image: Optional[bytes]) -> dict:
     return {"image": image} if image is not None else {}
 
 
+def _vision_headers(image: Optional[bytes]) -> dict:
+    return {"X-Copilot-Image-Bytes": str(len(image) if image else 0)}
+
+
+def _log_request(req: ChatCompletionRequest, prompt: str, image: Optional[bytes]) -> None:
+    if not DEBUG_REQUESTS:
+        return
+    print(
+        f"[copilot-api] model={req.model!r} stream={req.stream} "
+        f"image_bytes={len(image) if image else 0} "
+        f"parts=[{describe_trailing_content(req.messages)}] "
+        f"prompt={prompt[:80]!r}",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
 def _record_turn(messages: List[ChatMessage], conversation_id: Optional[str]) -> None:
     store_key = messages_store_key(messages)
     _session_store.put(store_key, conversation_id)
@@ -143,10 +169,15 @@ def _stream(
 
 @app.get("/v1/models")
 def list_models():
+    ids = []
+    for model_id in [MODEL_NAME, *MODEL_ALIASES]:
+        if model_id not in ids:
+            ids.append(model_id)
     return {
         "object": "list",
         "data": [
-            {"id": MODEL_NAME, "object": "model", "created": 0, "owned_by": "microsoft"}
+            {"id": model_id, "object": "model", "created": 0, "owned_by": "microsoft"}
+            for model_id in ids
         ],
     }
 
@@ -165,10 +196,11 @@ def chat_completions(req: ChatCompletionRequest):
             status_code=400,
             content={"error": {
                 "message": (
-                    "The request contains an [Image: ...] placeholder but no image "
-                    "bytes. Cherry Studio must send a real image_url or file part "
-                    "(data:image/...;base64,...) — placeholders alone cannot be "
-                    "forwarded to Copilot."
+                    "No image bytes reached the server. The client signalled an "
+                    "image (or sent [Image: ...] placeholder text) but the payload "
+                    "contained no decodable image data. In Cherry Studio, re-attach "
+                    "the image and check the network request includes image_url / "
+                    "file.data / image fields with base64 content."
                 ),
                 "type": "invalid_request_error",
             }},
@@ -180,6 +212,7 @@ def chat_completions(req: ChatCompletionRequest):
         )
     model = req.model or MODEL_NAME
     upstream = _upstream_kwargs(image)
+    _log_request(req, prompt, image)
 
     limited = _rate_limited_response()
     if limited is not None:
@@ -189,6 +222,7 @@ def chat_completions(req: ChatCompletionRequest):
         return StreamingResponse(
             _stream(req.messages, prompt, model, conversation_id, image=image),
             media_type="text/event-stream",
+            headers=_vision_headers(image),
         )
 
     try:
@@ -198,14 +232,17 @@ def chat_completions(req: ChatCompletionRequest):
         return JSONResponse(
             status_code=503,
             content={"error": {"message": _CLEARANCE_HELP, "type": "clearance_required"}},
+            headers=_vision_headers(image),
         )
     except Exception as exc:
         return JSONResponse(
             status_code=502,
             content={"error": {"message": str(exc), "type": "upstream_error"}},
+            headers=_vision_headers(image),
         )
     _record_turn(req.messages, reply.conversation_id)
-    return completion_response(reply.text, model, reply.conversation_id)
+    body = completion_response(reply.text, model, reply.conversation_id)
+    return JSONResponse(content=body, headers=_vision_headers(image))
 
 
 @app.get("/")

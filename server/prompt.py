@@ -17,7 +17,7 @@ from urllib.request import Request, urlopen
 from .schemas import ChatMessage
 
 _DATA_URL_RE = re.compile(r"^data:([^;,]+)?;base64,(.+)$", re.DOTALL | re.IGNORECASE)
-_IMAGE_PLACEHOLDER_RE = re.compile(r"^\[Image:\s*.+\]$", re.IGNORECASE)
+_IMAGE_PLACEHOLDER_RE = re.compile(r"^\[Image(?::|\])", re.IGNORECASE)
 _DEFAULT_IMAGE_PROMPT = "Describe this image in detail."
 
 
@@ -53,13 +53,19 @@ def _hash_user_texts(user_texts: List[str]) -> str:
     ).hexdigest()
 
 
-def messages_session_key(messages: List[ChatMessage]) -> Optional[str]:
-    """Lookup key for an in-flight multi-turn chat, or ``None`` for a new thread.
+def _trailing_user_messages(messages: List[ChatMessage]) -> List[ChatMessage]:
+    """Consecutive ``user`` messages at the end (one client turn, split bubbles)."""
+    trail: List[ChatMessage] = []
+    for message in reversed(messages):
+        if message.role == "user":
+            trail.append(message)
+        else:
+            break
+    return list(reversed(trail))
 
-    Keys are derived from the sequence of *user* messages only (all but the
-    latest), so assistant wording drift in the client history does not break
-    continuation.
-    """
+
+def messages_session_key(messages: List[ChatMessage]) -> Optional[str]:
+    """Lookup key for an in-flight multi-turn chat, or ``None`` for a new thread."""
     users = _user_texts(messages)
     if len(users) <= 1:
         return None
@@ -72,13 +78,6 @@ def messages_store_key(messages: List[ChatMessage]) -> Optional[str]:
     if not users:
         return None
     return _hash_user_texts(users)
-
-
-def _last_user_message(messages: List[ChatMessage]) -> Optional[ChatMessage]:
-    for message in reversed(messages):
-        if message.role == "user":
-            return message
-    return None
 
 
 def _image_url_to_bytes(url: str) -> bytes:
@@ -117,6 +116,14 @@ def _looks_like_image_mime(mime: Optional[str]) -> bool:
     return bool(mime and str(mime).lower().startswith("image/"))
 
 
+def _mime_from_part(part: dict) -> Optional[str]:
+    for key in ("mediaType", "mimeType", "mime_type"):
+        value = part.get(key)
+        if value:
+            return str(value)
+    return None
+
+
 def _image_part_url(part: dict) -> Optional[str]:
     """Extract a URL string from one OpenAI-style multimodal content part."""
     part_type = part.get("type")
@@ -126,13 +133,17 @@ def _image_part_url(part: dict) -> Optional[str]:
             return image_url.get("url")
         if isinstance(image_url, str):
             return image_url
-    if part_type in ("input_image", "image"):
-        for key in ("url", "data", "image_url"):
+    if part_type == "input_image":
+        for key in ("image_url", "url"):
             value = part.get(key)
             if isinstance(value, str):
                 return value
             if isinstance(value, dict) and isinstance(value.get("url"), str):
                 return value["url"]
+    if part_type == "image":
+        image_val = part.get("image")
+        if isinstance(image_val, str) and image_val.startswith(("http://", "https://", "data:")):
+            return image_val
     return None
 
 
@@ -143,8 +154,16 @@ def _image_part_bytes(part: dict) -> Optional[bytes]:
         return _image_url_to_bytes(url)
 
     part_type = part.get("type")
+    if part_type == "image":
+        # Cherry Studio / Vercel AI SDK: { type: "image", image: "<base64>", mediaType }
+        image_val = part.get("image")
+        if isinstance(image_val, str):
+            if image_val.startswith(("http://", "https://", "data:")):
+                return _image_url_to_bytes(image_val)
+            return _decode_base64_payload(image_val)
+
     if part_type == "file":
-        mime = part.get("mediaType") or part.get("mime_type") or part.get("mimeType")
+        mime = _mime_from_part(part)
         for key in ("data", "file_data", "content"):
             value = part.get(key)
             if isinstance(value, str) and _looks_like_image_mime(mime):
@@ -165,30 +184,8 @@ def _image_part_bytes(part: dict) -> Optional[bytes]:
     return None
 
 
-def has_image_placeholder_without_bytes(messages: List[ChatMessage]) -> bool:
-    """True when the client UI showed an image but only a text placeholder arrived."""
-    message = _last_user_message(messages)
-    if message is None or not isinstance(message.content, list):
-        return False
-    has_placeholder = any(
-        isinstance(part, dict)
-        and part.get("type") == "text"
-        and isinstance(part.get("text"), str)
-        and _IMAGE_PLACEHOLDER_RE.match(part["text"].strip())
-        for part in message.content
-    )
-    return has_placeholder and turn_image(messages) is None
-
-
-def turn_image(messages: List[ChatMessage]) -> Optional[bytes]:
-    """Return image bytes from the latest user message, if any.
-
-    When a client sends several images in one turn (e.g. Cherry Studio), only
-    the *first* image part in ``content`` is forwarded — Copilot's driver
-    accepts one attachment per turn.
-    """
-    message = _last_user_message(messages)
-    if message is None or not isinstance(message.content, list):
+def _image_from_message(message: ChatMessage) -> Optional[bytes]:
+    if not isinstance(message.content, list):
         return None
     for part in message.content:
         if not isinstance(part, dict):
@@ -199,13 +196,78 @@ def turn_image(messages: List[ChatMessage]) -> Optional[bytes]:
     return None
 
 
+def has_image_placeholder_without_bytes(messages: List[ChatMessage]) -> bool:
+    """True when the client signalled an image but no decodable bytes arrived."""
+    for message in _trailing_user_messages(messages):
+        if not isinstance(message.content, list):
+            continue
+        has_placeholder = any(
+            isinstance(part, dict)
+            and part.get("type") == "text"
+            and isinstance(part.get("text"), str)
+            and _IMAGE_PLACEHOLDER_RE.match(part["text"].strip())
+            for part in message.content
+        )
+        has_image_part = any(
+            isinstance(part, dict)
+            and part.get("type") in ("image", "image_url", "file", "input_image")
+            for part in message.content
+        )
+        if (has_placeholder or has_image_part) and _image_from_message(message) is None:
+            return True
+    return False
+
+
+def describe_trailing_content(messages: List[ChatMessage]) -> str:
+    """Safe summary of content-part types in the current user turn (for debugging)."""
+    parts = []
+    for message in _trailing_user_messages(messages):
+        content = message.content
+        if isinstance(content, str):
+            parts.append(f"str({len(content)} chars)")
+        elif isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict):
+                    part_type = part.get("type", "?")
+                    extra = ""
+                    if part_type == "text":
+                        text = str(part.get("text", ""))
+                        extra = f" {len(text)} chars"
+                    elif part_type in ("image", "image_url", "file", "input_image"):
+                        extra = " (+payload)" if _image_part_bytes(part) else " (no bytes)"
+                    parts.append(f"{part_type}{extra}")
+                else:
+                    parts.append(type(part).__name__)
+        else:
+            parts.append("empty")
+    return ", ".join(parts) if parts else "none"
+
+
+def turn_image(messages: List[ChatMessage]) -> Optional[bytes]:
+    """Return image bytes from the current client turn, if any.
+
+    Scans consecutive trailing ``user`` messages (split image/text bubbles).
+    When several images are present, only the first is forwarded.
+    """
+    for message in reversed(_trailing_user_messages(messages)):
+        image_bytes = _image_from_message(message)
+        if image_bytes:
+            return image_bytes
+    return None
+
+
 def turn_prompt(messages: List[ChatMessage], *, image_attached: bool = False) -> str:
-    """Build the Copilot prompt for one turn: optional system prefix + last user."""
+    """Build the Copilot prompt for one turn: optional system prefix + user text."""
     system = "\n\n".join(
         content_text(m.content) for m in messages if m.role == "system" and m.content
     )
+    trailing_text = "\n\n".join(
+        text
+        for m in _trailing_user_messages(messages)
+        if (text := content_text(m.content).strip())
+    )
     users = _user_texts(messages)
-    body = users[-1] if users else ""
+    body = trailing_text or (users[-1] if users else "")
     if not body.strip() and image_attached:
         body = _DEFAULT_IMAGE_PROMPT
     if system and body:
@@ -214,11 +276,7 @@ def turn_prompt(messages: List[ChatMessage], *, image_attached: bool = False) ->
 
 
 def messages_to_prompt(messages: List[ChatMessage]) -> str:
-    """Flatten an OpenAI ``messages`` array into a single Copilot prompt.
-
-    Deprecated for the HTTP server path — kept for callers that intentionally
-    want the old all-in-one transcript shape.
-    """
+    """Flatten an OpenAI ``messages`` array into a single Copilot prompt."""
     system = "\n\n".join(
         content_text(m.content) for m in messages if m.role == "system" and m.content
     )

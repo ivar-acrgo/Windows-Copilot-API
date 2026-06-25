@@ -54,6 +54,10 @@ def is_accepted_format(data: bytes) -> str:
     """Determine the MIME type of image data."""
     if data.startswith(b'\x89PNG\r\n\x1a\n'):
         return 'image/png'
-    elif data.startswith(b'\xff\xd8'):
+    if data.startswith(b'\xff\xd8'):
         return 'image/jpeg'
+    if data.startswith(b'GIF87a') or data.startswith(b'GIF89a'):
+        return 'image/gif'
+    if len(data) >= 12 and data[:4] == b'RIFF' and data[8:12] == b'WEBP':
+        return 'image/webp'
     return 'application/octet-stream'
