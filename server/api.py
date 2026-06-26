@@ -6,6 +6,7 @@ import time
 from typing import List, Optional, Tuple
 
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from copilot import CopilotClient
@@ -38,6 +39,13 @@ from .schemas import ChatCompletionRequest, ChatMessage
 from .sessions import ConversationSessionStore
 
 app = FastAPI(title="Copilot OpenAI-compatible API", version="1.0.0")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 # Server runs headless and must never pop a visible browser mid-request. With
 # both recovery passes disabled, an expired clearance surfaces immediately as a
 # 503 (see ClearanceRequired handling below) so an operator can re-clear out of
