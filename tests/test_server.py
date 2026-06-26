@@ -14,8 +14,16 @@ class ServerStartupTests(unittest.TestCase):
         with patch.dict(os.environ, {}, clear=True):
             app()
 
-        self.assertEqual(run.call_args.kwargs["host"], "127.0.0.1")
+        self.assertEqual(run.call_args.kwargs["host"], "0.0.0.0")
         self.assertEqual(run.call_args.kwargs["port"], 8000)
+
+    @patch("uvicorn.run")
+    @patch("copilot.auth.load_auth")
+    def test_ipv6_host_from_environment(self, _load_auth, run):
+        with patch.dict(os.environ, {"HOST": "::", "PORT": "8000"}, clear=True):
+            app()
+
+        self.assertEqual(run.call_args.kwargs["host"], "::")
 
     @patch("uvicorn.run")
     @patch("copilot.auth.load_auth")

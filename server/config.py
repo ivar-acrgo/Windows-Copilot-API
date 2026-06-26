@@ -27,3 +27,8 @@ SESSION_TTL_SECONDS = float(os.environ.get("SESSION_TTL_SECONDS", str(24 * 3600)
 
 # Log a one-line summary of each /v1/chat/completions request to stderr.
 DEBUG_REQUESTS = os.environ.get("DEBUG_REQUESTS", "").lower() in ("1", "true", "yes")
+
+# HTTP bind address. Default ``0.0.0.0`` listens on all IPv4 interfaces (LAN/Pi/Docker).
+# Use ``HOST=127.0.0.1`` for local-only. Use ``HOST=::`` for all IPv6 interfaces.
+HOST = os.environ.get("HOST", "0.0.0.0")
+PORT = int(os.environ.get("PORT", "8000"))

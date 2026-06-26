@@ -5,8 +5,9 @@ Start it:
     from server import app
     app()
 
-(`python app.py` in the project root does exactly this.) The server runs on
-http://127.0.0.1:8000 — set HOST / PORT to override. It bridges the OpenAI Chat
+(`python app.py` in the project root does exactly this.) The server listens on
+``0.0.0.0:8000`` by default (all IPv4 interfaces). Set ``HOST`` / ``PORT`` to
+override — e.g. ``HOST=127.0.0.1`` for local-only, ``HOST=::`` for IPv6.
 Completions shape onto :class:`copilot.CopilotClient`; sign in once first with
 ``python -m copilot login``.
 
@@ -23,6 +24,15 @@ Code is split by concern:
 import os
 
 from .api import app as _api
+from .config import HOST as DEFAULT_HOST, PORT as DEFAULT_PORT
+
+
+def _listen_url(host: str, port: int) -> str:
+    if host == "0.0.0.0":
+        return f"http://{host}:{port}  (all IPv4 interfaces)"
+    if host == "::":
+        return f"http://[{host}]:{port}  (all IPv6 interfaces)"
+    return f"http://{host}:{port}"
 
 
 def app(host=None, port=None) -> None:
@@ -36,9 +46,9 @@ def app(host=None, port=None) -> None:
     from copilot.auth import load_auth
 
     if host is None:
-        host = os.environ.get("HOST", "127.0.0.1")
+        host = os.environ.get("HOST", DEFAULT_HOST)
     if port is None:
-        port = int(os.environ.get("PORT", "8000"))
+        port = int(os.environ.get("PORT", str(DEFAULT_PORT)))
 
     # Use cached session/token.json when fresh; never pop a browser from the
     # server process (headless Pi has no Playwright — copy token.json from a PC).
@@ -47,7 +57,10 @@ def app(host=None, port=None) -> None:
     except Exception as exc:
         print(f"Warning: could not establish a Copilot session: {exc}")
 
-    print(f"Copilot OpenAI-compatible API on http://{host}:{port}  (POST /v1/chat/completions)")
+    print(
+        f"Copilot OpenAI-compatible API on {_listen_url(host, port)}  "
+        f"(POST /v1/chat/completions)"
+    )
     uvicorn.run(_api, host=host, port=port)
 
 
