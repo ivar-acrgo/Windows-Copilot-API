@@ -52,7 +52,14 @@ def load_auth(
         except (ValueError, OSError):
             pass  # corrupt/unreadable -> refresh below
 
-    from .browser import BrowserCopilot
+    try:
+        from .browser import BrowserCopilot
+    except ImportError as exc:
+        raise RuntimeError(
+            "Playwright is not installed. On a Raspberry Pi or other headless host, "
+            "run `python -m copilot login` on your PC, then copy session/token.json "
+            "(and refresh it when it expires)."
+        ) from exc
 
     # Try a headless read first: a signed-in profile just needs a fresh token.
     # For encrypted-cache sessions (e.g. Google) the token can't be read from

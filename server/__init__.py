@@ -40,11 +40,10 @@ def app(host=None, port=None) -> None:
     if port is None:
         port = int(os.environ.get("PORT", "8000"))
 
-    # Ensure a signed-in Copilot session exists before we start serving. On the
-    # very first run this triggers the interactive browser sign-in (instead of
-    # letting the first HTTP request fail), then caches it for reuse.
+    # Use cached session/token.json when fresh; never pop a browser from the
+    # server process (headless Pi has no Playwright — copy token.json from a PC).
     try:
-        load_auth()
+        load_auth(auto_login=False)
     except Exception as exc:
         print(f"Warning: could not establish a Copilot session: {exc}")
 

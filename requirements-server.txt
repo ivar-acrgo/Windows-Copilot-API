@@ -1,0 +1,6 @@
+# Headless API server only (Raspberry Pi, VPS). No Playwright — sign in on a PC
+# with `pip install -r requirements.txt` + `python -m copilot login`, then copy
+# session/token.json here.
+curl_cffi>=0.15
+fastapi>=0.110
+uvicorn>=0.29

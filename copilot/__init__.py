@@ -15,7 +15,6 @@ Basic usage — one client, conversations addressed by id:
 __version__ = '1.0.0'
 
 from .auth import load_auth
-from .browser import BrowserCopilot
 from .client import ChatReply, CopilotClient
 from .driver import ClearanceRequired, Copilot
 
@@ -27,3 +26,11 @@ __all__ = [
     'BrowserCopilot',
     'load_auth',
 ]
+
+
+def __getattr__(name: str):
+    """Lazy import: Playwright is optional (not available on Raspberry Pi armv7)."""
+    if name == "BrowserCopilot":
+        from .browser import BrowserCopilot
+        return BrowserCopilot
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
